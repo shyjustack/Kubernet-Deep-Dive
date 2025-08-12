@@ -1,0 +1,406 @@
+dnf update -y
+
+systemctl stop firewalld 
+systemctl disable firewalld 
+
+sudo setenforce 0
+sudo sed -i --follow-symlinks 's/^SELINUX=enforcing/SELINUX=permissive/' /etc/selinux/config
+
+sudo swapoff -a
+sudo sed -i '/swap/d' /etc/fstab
+
+cat <<EOF | sudo tee /etc/yum.repos.d/kubernetes.repo
+[kubernetes]
+name=Kubernetes
+baseurl=https://pkgs.k8s.io/core:/stable:/v1.29/rpm/
+enabled=1
+gpgcheck=1
+repo_gpgcheck=1
+gpgkey=https://pkgs.k8s.io/core:/stable:/v1.29/rpm/repodata/repomd.xml.key
+EOF
+
+sudo dnf -y install dnf-plugins-core
+sudo dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+sudo dnf install -y kubelet kubeadm kubectl
+sudo systemctl enable --now kubelet
+
+sudo mkdir -p /etc/containerd
+containerd config default | sudo tee /etc/containerd/config.toml
+
+
+sudo sed -i 's/^.*SystemdCgroup *= *.*/            SystemdCgroup = true/' /etc/containerd/config.toml
+
+sudo systemctl restart containerd
+sudo systemctl enable containerd
+
+sudo modprobe br_netfilter
+sudo tee /etc/sysctl.d/k8s.conf > /dev/null <<EOF
+net.bridge.bridge-nf-call-iptables = 1
+net.ipv4.ip_forward = 1
+EOF
+sudo sysctl --system
+
+
+sudo kubeadm init --pod-network-cidr=10.244.0.0/16
+
+
+############ISSUE FOR Cleint join only fix ##########
+
+[root@worker01 ~]# kubeadm join 10.30.34.200:6443 --token v12ybe.h810gvxtqzt7aip0         --discovery-token-ca-cert-hash sha256:dde89d9ecfa33386abd0cabf0262a2bdfc147c4a5706510c051ae18dec05dbf8
+[preflight] Running pre-flight checks
+error execution phase preflight: [preflight] Some fatal errors occurred:
+        [ERROR CRI]: container runtime is not running: output: time="2025-05-26T12:49:46+04:00" level=fatal msg="validate service connection: validate CRI v1 runtime API for endpoint \"unix:///var/run/containerd/containerd.sock\": rpc error: code = Unimplemented desc = unknown service runtime.v1.RuntimeService"
+, error: exit status 1
+[preflight] If you know what you are doing, you can make a check non-fatal with `--ignore-preflight-errors=...`
+To see the stack trace of this error execute with --v=5 or higher
+-----------------------------------------
+# 1. Create config directory (if not exists)
+sudo mkdir -p /etc/containerd
+
+# 2. Generate default config file
+containerd config default | sudo tee /etc/containerd/config.toml > /dev/null
+
+# 3. Set SystemdCgroup = true
+sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+
+# 4. Restart containerd to apply changes
+sudo systemctl restart containerd
+sudo systemctl enable containerd
+
+# 5. (Optional but recommended) Confirm containerd is running
+sudo systemctl status containerd
+
+# 6. (Optional) Test CRI interface is working
+crictl info
+#####################################################################
+
+
+*****************************CEPH*********************
+
+# Set hostname (customize per node)
+hostnamectl set-hostname ceph-mon01   # or ceph-osd01, ceph-osd02
+
+# Update system
+dnf update -y
+
+# Disable firewall (or allow Ceph ports)
+systemctl disable --now firewalld
+
+# Disable SELinux (for simplicity)
+setenforce 0
+sed -i 's/^SELINUX=.*/SELINUX=disabled/' /etc/selinux/config
+
+# Enable passwordless SSH between nodes
+ssh-keygen
+ssh-copy-id user@<other_nodes>
+
+#Networking Best Practices:
+Use separate networks for:
+
+Public network (client-facing)
+Cluster network (Ceph replication)
+
+
+public_network = 10.30.34.0/24
+cluster_network = 192.168.90.0/24
+
+
+dnf install -y dnf-plugins-core
+dnf install -y https://download.ceph.com/rpm-quincy/el9/noarch/ceph-release-1-1.el9.noarch.rpm
+dnf update -y
+
+#dnf install -y epel-release
+#dnf update -y
+dnf install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm
+#dnf install -y gperftools-libs thrift liboath
+dnf install -y cephadm ceph-common podman
+
+#Bootstrap with Internal IP
+cephadm bootstrap --mon-ip 192.168.90.10
+
+***************output*******************
+Ceph Dashboard is now available at:
+
+             URL: https://ceph01:8443/
+            User: admin
+        Password: m687yyf09y
+		
+
+Enabling client.admin keyring and conf on hosts with "admin" label
+Saving cluster configuration to /var/lib/ceph/53150a2c-3a26-11f0-8c00-00155d1e785c/config directory
+Enabling autotune for osd_memory_target
+You can access the Ceph CLI as following in case of multi-cluster or non-default config:
+
+        sudo /usr/sbin/cephadm shell --fsid 53150a2c-3a26-11f0-8c00-00155d1e785c -c /etc/ceph/ceph.conf -k /etc/ceph/ceph.client.admin.keyring
+
+Or, if you are only running a single cluster on this host:
+
+        sudo /usr/sbin/cephadm shell
+
+Please consider enabling telemetry to help improve Ceph:
+
+        ceph telemetry on
+
+For more information see:
+
+        https://docs.ceph.com/docs/master/mgr/telemetry/
+
+
+*****************************************
+
+#Bind Dashboard to External IP
+ceph config set mgr mgr/dashboard/server_addr 10.30.34.202
+ceph mgr module disable dashboard
+ceph mgr module enable dashboard
+
+-----------------------------------------------------------------------------
+| Traffic Type       | IP Type     | Configuration                           |
+| ------------------ | ----------- | --------------------------------------- |
+| MONs, OSDs, MGRs   | Internal IP | `--mon-ip`, `cluster_network` |
+| Dashboard / Client | Public IP   | `server_addr`, firewall open on 8443    |
+------------------------------------------------------------------------------
+
+#pending
+export CEPHADM_ADMIN_KEYRING=/etc/ceph/ceph.client.admin.keyring
+ceph -s
+
+#Deploy SSH key and add hosts
+ceph orch host add ceph03 192.168.90.12
+ceph orch host add ceph02 192.168.90.11
+
+##################################ERROR###################################
+[root@ceph01 yum.repos.d]# ceph orch host add ceph03 192.168.90.12
+Error EINVAL: Failed to connect to ceph03 (192.168.90.12). Permission denied
+Log: Opening SSH connection to 192.168.90.12, port 22
+[conn=13] Connected to SSH server at 192.168.90.12, port 22
+[conn=13]   Local address: 192.168.90.10, port 55808
+[conn=13]   Peer address: 192.168.90.12, port 22
+[conn=13] Beginning auth for user root
+[conn=13] Auth failed for user root
+[conn=13] Connection failure: Permission denied
+[conn=13] Aborting connection
+
+[root@ceph01 yum.repos.d]#
+
+##################################################################
+
+#Solution 
+ceph cephadm get-pub-key > ceph.pub
+ssh root@192.168.90.12 "mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys" < ceph.pub
+ssh root@192.168.90.11 "mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys" < ceph.pub
+ssh root@192.168.90.12 hostname
+ceph orch host add ceph03 192.168.90.12
+ceph orch host add ceph02 192.168.90.11
+
+************************************************************************************************
+#General Question 
+Great question!
+
+Is it recommended to run OSDs on MON servers in Ceph?
+
+Best Practice:
+It is generally not recommended to run OSDs (Object Storage Daemons) on MON (Monitor) nodes.
+
+Why?
+MON nodes are critical for cluster health and quorum. They maintain cluster state and consensus.
+
+Running OSDs on MON nodes can lead to resource contention (CPU, memory, disk I/O), which may affect monitor stability.
+
+Separating MON and OSD roles improves reliability and performance by isolating critical monitor functions.
+
+When is it okay?
+In small or test/dev environments, where hardware is limited, it’s sometimes acceptable to co-locate MON and OSD daemons.
+
+For production or larger clusters, best practice is to dedicate separate servers or at least separate disks for MON and OSD roles.
+
+Summary:
+Setup	Recommended?
+Separate MON and OSD	✅ Best practice
+MON + OSD on same node	⚠️ Not recommended (except test/dev)
+
+***************************************************************************************
+#Create OSDs
+Check available devices:
+
+ceph orch device ls
+
+ceph orch daemon add osd ceph02:/dev/sdb
+ceph orch daemon add osd ceph02:/dev/sdc
+ceph orch daemon add osd ceph03:/dev/sdb
+ceph orch daemon add osd ceph03:/dev/sdc
+
+Final Checks
+ceph -s
+ceph health detail
+
+
+ceph osd pool create kubernetes
+rbd pool init kubernetes
+----------------------------
+[root@ceph01 ~]# ceph auth get-or-create client.kubernetes mon 'profile rbd' osd 'profile rbd pool=kubernetes' mgr 'profile rbd pool=kubernetes'
+
+[client.kubernetes]
+        key = AQDemzRoC5qYMBAACTzB8inFLWVAAPfEo8jx9w==
+---------------------------------
+
+[root@ceph01 ~]# ceph mon dump
+epoch 3
+fsid 53150a2c-3a26-11f0-8c00-00155d1e785c
+last_changed 2025-05-26T12:24:08.610383+0000
+created 2025-05-26T11:42:28.865965+0000
+min_mon_release 17 (quincy)
+election_strategy: 1
+0: [v2:192.168.90.10:3300/0,v1:192.168.90.10:6789/0] mon.ceph01
+1: [v2:192.168.90.12:3300/0,v1:192.168.90.12:6789/0] mon.ceph03
+2: [v2:192.168.90.11:3300/0,v1:192.168.90.11:6789/0] mon.ceph02
+dumped monmap epoch 3
+
+--------------------------------------
+cat <<EOF > csi-config-map.yaml
+---
+apiVersion: v1
+kind: ConfigMap
+data:
+  config.json: |-
+    [
+      {
+        "clusterID": "53150a2c-3a26-11f0-8c00-00155d1e785c",
+        "monitors": [
+          "192.168.90.10:6789",
+          "192.168.90.11:6789",
+          "192.168.90.12:6789"
+        ]
+      }
+    ]
+metadata:
+  name: ceph-csi-config
+EOF
+
+
+--------------------
+$ cat <<EOF > csi-kms-config-map.yaml
+---
+apiVersion: v1
+kind: ConfigMap
+data:
+  config.json: |-
+    {}
+metadata:
+  name: ceph-csi-encryption-kms-config
+EOF
+
+kubectl apply -f csi-kms-config-map.yaml
+---------------------------
+
+ cat <<EOF > ceph-config-map.yaml
+---
+apiVersion: v1
+kind: ConfigMap
+data:
+  ceph.conf: |
+    [global]
+    auth_cluster_required = cephx
+    auth_service_required = cephx
+    auth_client_required = cephx
+  # keyring is a required key and its value should be empty
+  keyring: |
+metadata:
+  name: ceph-config
+EOF
+
+kubectl apply -f ceph-config-map.yaml
+-------------------------------------------
+
+
+cat <<EOF > csi-rbd-secret.yaml
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: csi-rbd-secret
+  namespace: default
+stringData:
+  userID: kubernetes
+  userKey: AQDemzRoC5qYMBAACTzB8inFLWVAAPfEo8jx9w==
+EOF
+
+kubectl apply -f csi-rbd-secret.yaml
+
+------------------------------------
+$ kubectl apply -f https://raw.githubusercontent.com/ceph/ceph-csi/master/deploy/rbd/kubernetes/csi-provisioner-rbac.yaml
+$ kubectl apply -f https://raw.githubusercontent.com/ceph/ceph-csi/master/deploy/rbd/kubernetes/csi-nodeplugin-rbac.yaml
+
+----------------After the deployment check the pod status *****************
+
+$ wget https://raw.githubusercontent.com/ceph/ceph-csi/master/deploy/rbd/kubernetes/csi-rbdplugin-provisioner.yaml
+$ kubectl apply -f csi-rbdplugin-provisioner.yaml
+$ wget https://raw.githubusercontent.com/ceph/ceph-csi/master/deploy/rbd/kubernetes/csi-rbdplugin.yaml
+$ kubectl apply -f csi-rbdplugin.yaml
+
+#File modification is required if the Master is not allow the deployment we need to change some confiuration 
+
+      priorityClassName: system-cluster-critical
+      tolerations:
+        - key: "node-role.kubernetes.io/control-plane"
+          operator: "Exists"
+          effect: "NoSchedule"
+      containers:
+        - name: csi-rbdplugin
+          ...
+----------------------------------------------------
+
+
+cat <<EOF > csi-rbd-sc.yaml
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+   name: csi-rbd-sc
+provisioner: rbd.csi.ceph.com
+parameters:
+   clusterID: 53150a2c-3a26-11f0-8c00-00155d1e785c
+   pool: kubernetes
+   imageFeatures: layering
+   csi.storage.k8s.io/provisioner-secret-name: csi-rbd-secret
+   csi.storage.k8s.io/provisioner-secret-namespace: default
+   csi.storage.k8s.io/controller-expand-secret-name: csi-rbd-secret
+   csi.storage.k8s.io/controller-expand-secret-namespace: default
+   csi.storage.k8s.io/node-stage-secret-name: csi-rbd-secret
+   csi.storage.k8s.io/node-stage-secret-namespace: default
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+mountOptions:
+   - discard
+EOF
+
+
+pv
+
+
+commands
+root@ceph01 ~]# ceph orch ps
+
+NAME                  HOST    PORTS             STATUS        REFRESHED  AGE  MEM USE  MEM LIM  VERSION  IMAGE ID      CONTAINER ID
+alertmanager.ceph01   ceph01  *:9093,9094       running (7h)     6m ago   8h    27.9M        -  0.25.0   c8568f914cd2  737bf7738a03
+crash.ceph01          ceph01                    running (8h)     6m ago   8h    6899k        -  17.2.8   259b35566514  44a46f1e0bbc
+crash.ceph02          ceph02                    running (7h)     2m ago   7h    6895k        -  17.2.8   259b35566514  56b96c33da76
+crash.ceph03          ceph03                    running (7h)   100s ago   7h    6899k        -  17.2.8   259b35566514  2c66a2927923
+grafana.ceph01        ceph01  *:3000            running (8h)     6m ago   8h    85.2M        -  9.4.7    954c08fa6188  dd824114f420
+mgr.ceph01.kkjqol     ceph01  *:9283,8765,8443  running (8h)     6m ago   8h     504M        -  17.2.8   259b35566514  544e3031c551
+mgr.ceph03.zpiwnv     ceph03  *:8443,9283       running (7h)   100s ago   7h     411M        -  17.2.8   259b35566514  5a2e9ec1fbbf
+mon.ceph01            ceph01                    running (8h)     6m ago   8h     190M    2048M  17.2.8   259b35566514  0a5bf5c84c6e
+mon.ceph02            ceph02                    running (7h)     2m ago   7h     175M    2048M  17.2.8   259b35566514  31ecc4a49e04
+mon.ceph03            ceph03                    running (7h)   100s ago   7h     179M    2048M  17.2.8   259b35566514  fb6d26958eca
+node-exporter.ceph01  ceph01  *:9100            running (8h)     6m ago   8h    15.8M        -  1.5.0    0da6a335fe13  60d21959bd5f
+node-exporter.ceph02  ceph02  *:9100            running (7h)     2m ago   7h    17.2M        -  1.5.0    0da6a335fe13  5fe36430a55c
+node-exporter.ceph03  ceph03  *:9100            running (7h)   100s ago   7h    15.5M        -  1.5.0    0da6a335fe13  4afd7f2c17d6
+osd.0                 ceph02                    running (7h)     2m ago   7h    64.9M    2277M  17.2.8   259b35566514  b6c3f4e9ac86
+osd.1                 ceph02                    running (7h)     2m ago   7h    67.5M    2277M  17.2.8   259b35566514  fefd06c27bf4
+osd.2                 ceph03                    running (7h)   100s ago   7h    64.4M    4096M  17.2.8   259b35566514  6c62d2cea3b3
+osd.3                 ceph03                    running (7h)   100s ago   7h    57.1M    4096M  17.2.8   259b35566514  1a44c7e15096
+prometheus.ceph01     ceph01  *:9095            running (7h)     6m ago   8h    71.5M        -  2.43.0   a07b618ecd1d  42dae3fe965c
+[root@ceph01 ~]#
+[root@ceph01 ~]#
+
+	
+
